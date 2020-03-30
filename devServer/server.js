@@ -3,21 +3,48 @@ const HTTP = require('http');
 const ChildProcess = require('child_process');
 const Path = require('path');
 
+const resolveImports = require('./moduleImportResolver');
 const utils = require('./utils');
 
 const tsconfig = utils.readTsConfig();
 const devBuildFolder = tsconfig.compilerOptions.outDir;
-const styleFolder = '/style';
 
 const port = process.env.PORT || 3000;
 const folderBeingWatched = process.env.WATCH;
 
 const httpServer = HTTP.createServer(requestListener);
+const changedFiles = new Set();
 
 let reloadTimeoutId;
 let reloadPending = false;
 let browserConnected = false;
 let dispatchEvent = () => {};
+
+const changeHandler = utils.debounce(() => {
+    const changedFilePaths = Array.from(changedFiles.values());
+    console.info(`files changed:\n\t${changedFilePaths.join('\n\t')}`);
+
+    changedFilePaths.forEach((filePath) => {
+        FileSystem.stat(filePath, (err, stats) => {
+            if (stats.isDirectory()) {
+                if (folderBeingWatched) {
+                    watchFolder(filePath);
+                }
+            }
+        });
+    });
+
+    changedFiles.clear();
+
+    if (browserConnected) {
+        dispatchEvent('reload');
+
+        reloadTimeoutId = setTimeout(() => {
+            console.info('pending reload');
+            reloadPending = true;
+        }, 250);
+    }
+}, 100);
 
 httpServer.listen(port, () => {
     console.info(`Server is listening at http://localhost:${port}\n`);
@@ -25,21 +52,9 @@ httpServer.listen(port, () => {
 });
 
 if (folderBeingWatched) {
-    watchFolder(folderBeingWatched, (changedFiles) => {
-        console.info(`files changed:\n\t${Array.from(changedFiles.values()).join('\n\t')}`);
-
-        if (!browserConnected) {
-            return;
-        }
-
-        dispatchEvent('reload');
-        changedFiles.clear();
-
-        reloadTimeoutId = setTimeout(() => {
-            console.info('pending reload');
-            reloadPending = true;
-        }, 250);
-    });
+    console.info(`watching folder: ${folderBeingWatched}\n`);
+    watchFolder(folderBeingWatched);
+    watchSubFolders(folderBeingWatched);
 }
 
 function requestListener(incomingMessage, serverResponse) {
@@ -88,6 +103,10 @@ async function serveFile(filePath, response) {
         const extension = filePath.split('.').pop();
         fileContent = await utils.readFile(filePath);
         response.setHeader('Content-Type', getContentTypeByExtension(extension));
+
+        if (extension === 'js') {
+            fileContent = resolveImports(fileContent.toString());
+        }
     } catch (error) {
         console.error(`can not serve file: ${error.path}`);
     } finally {
@@ -111,19 +130,17 @@ function initSSE(response) {
     dispatchEvent('connected');
 }
 
-async function watchFolder(path, changeHandler) {
-    const changedFiles = new Set();
-    const delayedChangeHandler = utils.debounce(changeHandler, 100);
+async function watchSubFolders(path) {
     const subFolders = await getFoldersRecursive(path);
 
-    [path, ...subFolders].forEach((folderPath) => {
-        FileSystem.watch(folderPath, (eventType, filename) => {
-            changedFiles.add(`${folderPath}/${filename}`);
-            delayedChangeHandler(changedFiles);
-        });
-    });
+    subFolders.forEach(watchFolder);
+}
 
-    console.info(`watching folder: ${path}\n`);
+function watchFolder(folderPath) {
+    FileSystem.watch(folderPath, (eventType, filename) => {
+        changedFiles.add(`${folderPath}/${filename}`);
+        changeHandler();
+    });
 }
 
 async function getFoldersRecursive(path, folders = []) {
